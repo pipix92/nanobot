@@ -853,6 +853,7 @@ def cron_run(
 def status():
     """Show nanobot status."""
     from nanobot.config.loader import load_config, get_config_path
+    from nanobot.providers.registry import PROVIDERS
 
     config_path = get_config_path()
     config = load_config()
@@ -860,35 +861,91 @@ def status():
 
     console.print(f"{__logo__} nanobot Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}")
+    # System info
+    system_table = Table(show_header=False, box=None, padding=(0, 1))
+    system_table.add_column("Key", style="dim")
+    system_table.add_column("Value")
+    system_table.add_row("Version", __version__)
+    system_table.add_row(
+        "Config",
+        f"{config_path} [green]✓[/green]" if config_path.exists() else f"{config_path} [red]✗[/red]",
+    )
+    system_table.add_row(
+        "Workspace",
+        f"{workspace} [green]✓[/green]" if workspace.exists() else f"{workspace} [red]✗[/red]",
+    )
+    system_table.add_row("Model", f"[cyan]{config.agents.defaults.model}[/cyan]")
+    console.print(system_table)
 
-    if config_path.exists():
-        from nanobot.providers.registry import PROVIDERS
+    if not config_path.exists():
+        console.print("\n[yellow]Run [bold]nanobot onboard[/bold] to initialize.[/yellow]")
+        return
 
-        console.print(f"Model: {config.agents.defaults.model}")
-        
-        # Check API keys from registry
-        for spec in PROVIDERS:
-            p = getattr(config.providers, spec.name, None)
-            if p is None:
-                continue
-            if spec.is_local:
-                # Local deployments show api_base instead of api_key
-                if p.api_base:
-                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
-                else:
-                    console.print(f"{spec.label}: [dim]not set[/dim]")
-            else:
-                has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+    # Providers table
+    console.print()
+    model = config.agents.defaults.model
+    active_provider = config.get_provider_name(model)
+
+    provider_table = Table(title="Providers", show_lines=False)
+    provider_table.add_column("Provider", style="cyan")
+    provider_table.add_column("Status")
+    provider_table.add_column("Key / Base URL", style="dim")
+
+    for spec in PROVIDERS:
+        p = getattr(config.providers, spec.name, None)
+        if p is None:
+            continue
+        active = spec.name == active_provider
+        label = f"[bold]{spec.label}[/bold] ★" if active else spec.label
+        if spec.is_oauth:
+            status_cell = "[dim]OAuth[/dim]"
+            detail = "nanobot provider login " + spec.name.replace("_", "-")
+        elif spec.is_local:
+            status_cell = "[green]✓[/green]" if p.api_base else "[dim]not set[/dim]"
+            detail = p.api_base or ""
+        else:
+            has_key = bool(p.api_key)
+            status_cell = "[green]✓[/green]" if has_key else "[dim]not set[/dim]"
+            detail = "[configured]" if has_key else ""
+        provider_table.add_row(label, status_cell, detail)
+
+    console.print(provider_table)
+    if active_provider:
+        console.print("[dim]★ = active provider for current model[/dim]")
+
+    # Channels table
+    console.print()
+    channel_table = Table(title="Channels", show_lines=False)
+    channel_table.add_column("Channel", style="cyan")
+    channel_table.add_column("Enabled")
+    channel_table.add_column("Details", style="dim")
+
+    ch = config.channels
+    _channel_rows = [
+        ("Telegram", ch.telegram.enabled, "[configured]" if ch.telegram.token else "not configured"),
+        ("Discord", ch.discord.enabled, ch.discord.gateway_url),
+        ("WhatsApp", ch.whatsapp.enabled, ch.whatsapp.bridge_url),
+        ("Slack", ch.slack.enabled, "socket" if ch.slack.app_token and ch.slack.bot_token else "not configured"),
+        ("Feishu", ch.feishu.enabled, "[configured]" if ch.feishu.app_id else "not configured"),
+        ("DingTalk", ch.dingtalk.enabled, "[configured]" if ch.dingtalk.client_id else "not configured"),
+        ("Email", ch.email.enabled, ch.email.imap_host or "not configured"),
+        ("Mochat", ch.mochat.enabled, ch.mochat.base_url),
+        ("QQ", ch.qq.enabled, "[configured]" if ch.qq.app_id else "not configured"),
+    ]
+    for name, enabled, detail in _channel_rows:
+        channel_table.add_row(
+            name,
+            "[green]✓[/green]" if enabled else "[dim]✗[/dim]",
+            detail,
+        )
+    console.print(channel_table)
 
 
 # ============================================================================
-# OAuth Login
+# Provider Commands
 # ============================================================================
 
-provider_app = typer.Typer(help="Manage providers")
+provider_app = typer.Typer(help="Manage LLM providers")
 app.add_typer(provider_app, name="provider")
 
 
@@ -929,6 +986,112 @@ def provider_login(
         console.print(f"[red]Unknown OAuth provider: {provider}[/red]")
         console.print("[yellow]Supported providers: openai-codex[/yellow]")
         raise typer.Exit(1)
+
+
+@provider_app.command("list")
+def provider_list():
+    """List all available providers and their configuration status."""
+    from nanobot.config.loader import load_config
+    from nanobot.providers.registry import PROVIDERS
+
+    config = load_config()
+    model = config.agents.defaults.model
+    active_provider = config.get_provider_name(model)
+
+    table = Table(title="LLM Providers")
+    table.add_column("Provider", style="cyan")
+    table.add_column("Status")
+    table.add_column("Key / Base URL", style="dim")
+    table.add_column("Keywords", style="dim")
+
+    for spec in PROVIDERS:
+        p = getattr(config.providers, spec.name, None)
+        if p is None:
+            continue
+        active = spec.name == active_provider
+        label = f"[bold]{spec.label}[/bold] ★" if active else spec.label
+        if spec.is_oauth:
+            status_cell = "[dim]OAuth[/dim]"
+            detail = "nanobot provider login " + spec.name.replace("_", "-")
+        elif spec.is_local:
+            status_cell = "[green]✓[/green]" if p.api_base else "[dim]not set[/dim]"
+            detail = p.api_base or ""
+        else:
+            has_key = bool(p.api_key)
+            status_cell = "[green]✓[/green]" if has_key else "[dim]not set[/dim]"
+            detail = "[configured]" if has_key else ""
+        keywords = ", ".join(spec.keywords) if spec.keywords else "(gateway)"
+        table.add_row(label, status_cell, detail, keywords)
+
+    console.print(table)
+    console.print(f"\nActive model: [cyan]{model}[/cyan]")
+    if active_provider:
+        console.print("[dim]★ = provider used for current model[/dim]")
+    console.print(
+        "\n[dim]To set a key: [bold]nanobot provider set-key <provider> <key>[/bold][/dim]"
+    )
+
+
+@provider_app.command("set-key")
+def provider_set_key(
+    provider: str = typer.Argument(..., help="Provider name (e.g. 'openrouter', 'anthropic', 'deepseek')"),
+    key: str = typer.Argument(..., help="API key to set"),
+):
+    """Set an API key for a provider."""
+    from nanobot.config.loader import load_config, save_config
+    from nanobot.providers.registry import PROVIDERS, find_by_name
+
+    spec = find_by_name(provider)
+    if spec is None:
+        names = [s.name for s in PROVIDERS if not s.is_oauth and not s.is_local]
+        console.print(f"[red]Unknown provider: {provider}[/red]")
+        console.print(f"Available: {', '.join(names)}")
+        raise typer.Exit(1)
+
+    if spec.is_oauth:
+        console.print(f"[yellow]{spec.label} uses OAuth, not API keys.[/yellow]")
+        console.print(f"Run: nanobot provider login {provider.replace('_', '-')}")
+        raise typer.Exit(1)
+
+    if spec.is_local:
+        console.print(f"[yellow]{spec.label} uses an api_base URL, not an API key.[/yellow]")
+        console.print("Edit ~/.nanobot/config.json to set the api_base for this provider.")
+        raise typer.Exit(1)
+
+    config = load_config()
+    p = getattr(config.providers, spec.name, None)
+    if p is None:
+        console.print(f"[red]Provider '{provider}' not found in config schema.[/red]")
+        raise typer.Exit(1)
+
+    p.api_key = key
+    save_config(config)
+    console.print(f"[green]✓[/green] API key set for [cyan]{spec.label}[/cyan]")
+
+
+@provider_app.command("set-model")
+def provider_set_model(
+    model: str = typer.Argument(..., help="Model name (e.g. 'claude-opus-4-5', 'gpt-4o', 'deepseek-chat')"),
+):
+    """Update the default model used by the agent."""
+    from nanobot.config.loader import load_config, save_config
+
+    config = load_config()
+    old_model = config.agents.defaults.model
+    config.agents.defaults.model = model
+    save_config(config)
+    console.print(f"[green]✓[/green] Default model updated")
+    console.print(f"  [dim]From:[/dim] {old_model}")
+    console.print(f"  [dim]  To:[/dim] [cyan]{model}[/cyan]")
+    # Warn if no provider can serve this model
+    new_provider = config.get_provider_name(model)
+    if new_provider:
+        from nanobot.providers.registry import find_by_name
+        spec = find_by_name(new_provider)
+        console.print(f"[dim]Provider: {spec.label if spec else new_provider}[/dim]")
+    else:
+        console.print("[yellow]Warning: no configured provider found for this model.[/yellow]")
+        console.print("[dim]Set an API key with: nanobot provider set-key <provider> <key>[/dim]")
 
 
 if __name__ == "__main__":
